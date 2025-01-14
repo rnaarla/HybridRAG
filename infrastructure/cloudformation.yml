@@ -1,0 +1,5 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation Template for HybridRAG Infrastructure"
+
+Resources:
+  # Define your resources here
