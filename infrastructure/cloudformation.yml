@@ -1,57 +1,105 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Description: "Full Hybrid RAG Infrastructure"
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31 
+
+Description: Comprehensive RAG Stack for Hybrid Retrieval-Augmented Generation (AWS Well-Architected Framework Compliant)
 
 Parameters:
-  VpcCidr:
+  Environment:
     Type: String
-    Default: "10.0.0.0/16"
-    Description: CIDR block for the VPC
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+    ConstraintDescription: Must be a valid environment.
 
-  PublicSubnet1Cidr:
+  AllowedCIDR:
     Type: String
-    Default: "10.0.1.0/24"
-    Description: CIDR block for Public Subnet 1
+    Default: 192.168.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: Allowed CIDR for security group access
+    ConstraintDescription: Must be a valid CIDR block.
 
-  PublicSubnet2Cidr:
-    Type: String
-    Default: "10.0.2.0/24"
-    Description: CIDR block for Public Subnet 2
-
-  ECSDesiredTaskCount:
+  BackupRetentionDays:
     Type: Number
-    Default: 2
-    Description: Desired number of ECS tasks to run
+    Default: 30
+    MinValue: 1
+    MaxValue: 35
+    Description: Retention period for backups (1-35 days)
+    ConstraintDescription: Must be a number between 1 and 35.
+
+  KmsKeyAlias:
+    Type: String
+    Default: "alias/default"
+    Description: KMS Key Alias for encryption
+
+  AlertEmail:
+    Type: String
+    Description: Email address for notifications
+    AllowedPattern: '.+@.+\\..+' 
+    ConstraintDescription: Must be a valid email address.
+
+  PineconeApiKey:
+    Type: String
+    Description: API Key for Pinecone Vector Database
+    NoEcho: true 
+
+Conditions:
+  IsProduction: !Equals [ !Sub ${Environment}, 'prod' ]
 
 Resources:
-  # VPC
   VPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: !Ref VpcCidr
+      CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: HybridRAG-VPC
+          Value: !Sub ${Environment}-VPC
+        - Key: Environment
+          Value: !Sub ${Environment}
 
-  # Subnets
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: !Ref PublicSubnet1Cidr
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: AWS::Region
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-PublicSubnet1
+        - Key: Environment
+          Value: !Sub ${Environment}
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: !Ref PublicSubnet2Cidr
-      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs 
+          Ref: AWS::Region
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-PublicSubnet2
+        - Key: Environment
+          Value: !Sub ${Environment}
 
-  # Internet Gateway
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-InternetGateway
+        - Key: Environment
+          Value: !Sub ${Environment}
 
   IGWAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -63,203 +111,318 @@ Resources:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-PublicRouteTable
+        - Key: Environment
+          Value: !Sub ${Environment}
 
   PublicRoute:
     Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PublicSubnet1RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet1
-      RouteTableId: !Ref PublicRouteTable
-
-  PublicSubnet2RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet2
-      RouteTableId: !Ref PublicRouteTable
-
-  # ECS Cluster
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: "HybridRAG-Cluster"
+      ClusterName: !Sub ${Environment}-ECSCluster
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
 
-  # ECS Security Group
-  ECSFargateSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow ECS traffic
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8000
-          ToPort: 8000
-          CidrIp: 0.0.0.0/0
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: 0.0.0.0/0
-
-  # ECS Task Execution Role
-  ECSTaskExecutionRole:
+  SageMakerExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service: sagemaker.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: ECSExecutionPolicy
+        - PolicyName: SageMakerAccess
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - "logs:*"
-                  - "ecs:*"
-                  - "s3:*"
-                Resource: "*"
+                  - s3:*
+                  - logs:*
+                  - sagemaker:*
+                  - neptune-db:*
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
 
-  # ECS Task Definition
-  ECSFargateTask:
-    Type: AWS::ECS::TaskDefinition
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
     Properties:
-      Family: "HybridRAG-Task"
-      Cpu: "256"
-      Memory: "512"
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
-      ContainerDefinitions:
-        - Name: "HybridRAG-Container"
-          Image: "your-container-image:latest"
-          PortMappings:
-            - ContainerPort: 8000
-              Protocol: tcp
-
-  # ECS Fargate Service
-  ECSFargateService:
-    Type: AWS::ECS::Service
-    Properties:
-      Cluster: !Ref ECSCluster
-      TaskDefinition: !Ref ECSFargateTask
-      DesiredCount: !Ref ECSDesiredTaskCount
-      LaunchType: FARGATE
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          Subnets:
-            - !Ref PublicSubnet1
-            - !Ref PublicSubnet2
-          SecurityGroups:
-            - !Ref ECSFargateSecurityGroup
-          AssignPublicIp: ENABLED
-
-  # Neptune Cluster
-  NeptuneDBCluster:
-    Type: AWS::Neptune::DBCluster
-    Properties:
-      DBClusterIdentifier: "HybridRAG-Neptune"
-      Engine: neptune
-      BackupRetentionPeriod: 7
-
-  NeptuneDBInstance:
-    Type: AWS::Neptune::DBInstance
-    Properties:
-      DBInstanceClass: db.r5.large
-      DBClusterIdentifier: !Ref NeptuneDBCluster
-
-  # AWS Kendra
-  KendraIndex:
-    Type: AWS::Kendra::Index
-    Properties:
-      Edition: ENTERPRISE_EDITION
-      Name: "HybridRAG-Kendra"
-      RoleArn: !GetAtt KendraRole.Arn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - logs:*
+                  - glue:*
+                  - neptune-db:*
+                  - kendra:*
+                  - states:*
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
 
   KendraRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: kendra.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: KendraPolicy
+        - PolicyName: KendraAccess
           PolicyDocument:
-            Version: "2012-10-17"
+            Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - "s3:*"
-                Resource: "*"
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
 
-  # Lambda for Query Processing
-  QueryProcessingLambda:
-    Type: AWS::Lambda::Function
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
     Properties:
-      Handler: "app.lambda_handler"
+      DBClusterIdentifier: !Sub ${Environment}-NeptuneCluster
+      EngineVersion: '1.2.1' 
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '03:00-04:00'
+      StorageEncrypted: true
+      KmsKeyId: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyAlias}'
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-NeptuneCluster
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceClass: !If [IsProduction, db.r5.large, db.t3.medium] 
+      DBClusterIdentifier: !Ref NeptuneCluster
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-NeptuneInstance
+        - Key: Environment
+          Value: !Sub ${Environment} 
+
+  GlueETL:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${Environment}-GlueETL
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: s3://your-bucket/transform.py # Replace with your script location
+      DefaultArguments:
+        '--TempDir': s3://your-bucket/temp-etl/  # Replace with your bucket
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Environment}/${AWS::StackName}"
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  CloudWatchAlarmGlue:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-GlueETLFailureAlarm
+      AlarmDescription: Glue ETL job failure detection.
+      MetricName: FailedJobs
+      Namespace: AWS/Glue
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  CloudWatchAlarmNeptune:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-NeptuneHealthAlarm
+      AlarmDescription: Alarm for Neptune instance health.
+      MetricName: CPUUtilization
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  CloudWatchAlarmLambda:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-LambdaExecutionErrorAlarm
+      AlarmDescription: Alarm for Lambda execution errors.
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Environment}-AlertTopic
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  BedrockService:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      ModelName: !Sub ${Environment}-BedrockLLM
+      PrimaryContainer:
+        Image: "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:1.13.1-gpu-py39"
+        Mode: SingleModel
+        Environment:
+          SAGEMAKER_PROGRAM: 'inference.py' # Example - provide your entry point
+          SAGEMAKER_SUBMIT_DIRECTORY: 's3://your-bucket/code/' # Example - provide your code location
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-BedrockService
+        - Key: Environment
+          Value: !Sub ${Environment}
+
+  VectorDatabaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler 
       Runtime: python3.9
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Code:
-        ZipFile: |
-          import json
-          def lambda_handler(event, context):
-              return {"statusCode": 200, "body": json.dumps("Hello, World!")}
-
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
+      CodeUri: s3://your-bucket/vector-db-function.zip  # Replace with your function code
       Policies:
-        - PolicyName: LambdaPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - "logs:*"
-                  - "neptune-db:*"
-                  - "kendra:*"
-                Resource: "*"
+        - AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonPineconeReadOnlyAccess 
+      Environment:
+        Variables:
+          PINECONE_API_KEY: !Ref PineconeApiKey
+          PINECONE_ENVIRONMENT: 'us-east1-gcp' # Replace if needed
+      Tags: 
+          Environment: !Sub ${Environment}
+          
+
+  VectorDatabase:
+    Type: Custom::Pinecone
+    Properties:
+      ServiceToken: !GetAtt VectorDatabaseFunction.Arn
+      Parameters:
+        - Name: VectorIndex
+          Value: RAG_VectorIndex
+        - Dimension: 512
+
+  QueryProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-QueryProcessor
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt GlueExecutionRole.Arn
+      CodeUri: s3://526rnravitest/query-processing-function.zip # Replace with your function code
+      Timeout: 60 
+      MemorySize: 512 
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: 'anthropic.claude-v2' # Replace with your model
+          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
+          NEPTUNE_PORT: !GetAtt NeptuneCluster.Port
+          PINECONE_API_KEY: !Ref PineconeApiKey
+          PINECONE_ENVIRONMENT: 'us-east1-gcp' # Replace if needed
+      Tags:
+          Environment: !Sub ${Environment}
 
 Outputs:
   VPCId:
     Description: VPC ID
     Value: !Ref VPC
 
-  ECSClusterName:
-    Description: ECS Cluster Name
-    Value: !Ref ECSCluster
+  SageMakerExecutionRoleArn:
+    Description: SageMaker Execution Role ARN
+    Value: !GetAtt SageMakerExecutionRole.Arn
 
-  ECSServiceArn:
-    Description: ARN of the ECS Service
-    Value: !GetAtt ECSFargateService.Arn
+  GlueExecutionRoleArn:
+    Description: Glue Execution Role ARN
+    Value: !GetAtt GlueExecutionRole.Arn
 
-  KendraIndexId:
-    Description: Kendra Index ID
-    Value: !Ref KendraIndex
+  KendraRoleArn:
+    Description: Kendra Execution Role ARN
+    Value: !GetAtt KendraRole.Arn
 
-  NeptuneEndpoint:
-    Description: Neptune Cluster Endpoint
-    Value: !GetAtt NeptuneDBCluster.Endpoint
+  BedrockServiceName:
+    Description: SageMaker Bedrock Service Name
+    Value: !Ref BedrockService 
 
-  LambdaFunctionArn:
-    Description: ARN of the Lambda Function
-    Value: !GetAtt QueryProcessingLambda.Arn
+  VectorDatabaseName:
+    Description: Pinecone Vector Index Name
+    Value: RAG_VectorIndex
+
+  QueryProcessorFunctionName:
+    Description: Query Processor Function Name
+    Value: !Ref QueryProcessingFunction
