@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced Neptune stack for RAG Pipeline infrastructure with high availability and monitoring"
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for Neptune cluster
+  
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of private subnet IDs for Neptune cluster (minimum 2 subnets recommended)
+  
+  KmsKeyAlias:
+    Type: String
+    Description: Alias for the KMS key
+  
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues: [dev, staging, prod]
+  
+  Owner:
+    Type: String
+    Description: Team or individual responsible for the stack
+  
+  CostCenter:
+    Type: String
+    Description: Cost center for billing and tracking
+  
+  ApplicationName:
+    Type: String
+    Default: RAGPipeline
+    Description: Name of the application
+  
+  NeptuneInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+    Description: Neptune instance class
+  
+  SNSNotificationEmail:
+    Type: String
+    Description: Email address for alarm notifications
+  
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum number of Neptune read replicas
+  
+  MaxCapacity:
+    Type: Number
+    Default: 3
+    Description: Maximum number of Neptune read replicas
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      BackupRetention: 7
+      DeletionProtection: false
+    staging:
+      BackupRetention: 14
+      DeletionProtection: true
+    prod:
+      BackupRetention: 35
+      DeletionProtection: true
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # Lambda function for tag management
+  TagMacroRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags: 
+        - Key: Environment
+          Value: !Ref Environment
+
+  TagMacro:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt TagMacroRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event, context) => {
+            const response = {
+              Status: 'SUCCESS',
+              PhysicalResourceId: event.LogicalResourceId,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: { Tags: event.ResourceProperties.Tags }
+            };
+            return response;
+          };
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 128
+      Tags: 
+        - Key: Environment
+          Value: !Ref Environment
+
+  CommonTags:
+    Type: Custom::Tags
+    Properties:
+      ServiceToken: !GetAtt TagMacro.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  SNSNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-notifications
+      DisplayName: Neptune Cluster Notifications
+      Tags: !GetAtt CommonTags.Tags
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSNotificationTopic
+      Protocol: email
+      Endpoint: !Ref SNSNotificationEmail
+
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Neptune cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          Description: Neptune port access
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+      Tags: !GetAtt CommonTags.Tags
+
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for applications accessing Neptune
+      VpcId: !Ref VpcId
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Neptune cluster
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneClusterParameterGroup:
+    Type: AWS::Neptune::DBClusterParameterGroup
+    Properties:
+      Family: neptune1
+      Description: Custom parameter group for Neptune cluster
+      Parameters:
+        neptune_enable_audit_log: 1
+        neptune_query_timeout: 120000
+        neptune_streams: 1
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub ${ApplicationName}-cluster-${Environment}
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      DBClusterParameterGroupName: !Ref NeptuneClusterParameterGroup
+      EngineVersion: "1.2.1.0"  # Explicit version instead of SSM parameter
+      Port: 8182
+      IamAuthEnabled: true
+      StorageEncrypted: true
+      KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${KmsKeyAlias}
+      BackupRetentionPeriod: !FindInMap [EnvironmentMap, !Ref Environment, BackupRetention]
+      PreferredBackupWindow: 02:00-03:00
+      PreferredMaintenanceWindow: Mon:03:00-Mon:04:00
+      DeletionProtection: !FindInMap [EnvironmentMap, !Ref Environment, DeletionProtection]
+      EnableCloudwatchLogsExports: [audit]
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      DBClusterIdentifier: !Ref NeptuneCluster
+      AutoMinorVersionUpgrade: true
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneReadonlyInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      DBClusterIdentifier: !Ref NeptuneCluster
+      AutoMinorVersionUpgrade: true
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub cluster:${NeptuneCluster}
+      RoleARN: !GetAtt NeptuneAutoScalingRole.Arn
+      ScalableDimension: neptune:cluster:ReadReplicaCount
+      ServiceNamespace: neptune
+
+  NeptuneScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-autoscaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref NeptuneScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: NeptuneReaderAverageCPUUtilization
+
+  NeptuneRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: neptune.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonNeptuneFullAccess
+      Policies:
+        - PolicyName: NeptuneS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${AWS::StackName}-*
+                  - !Sub arn:aws:s3:::${AWS::StackName}-*/*
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationAutoScalingCustomResource
+      Tags: !GetAtt CommonTags.Tags
+
+  NeptuneCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: neptune.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSNeptuneCloudWatchLogsRole
+      Policies:
+        - PolicyName: NeptuneCloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/neptune/*
+      Tags: !GetAtt CommonTags.Tags
+
+  # CloudWatch Alarms
+  NeptuneCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alert when CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      AlarmActions: 
+        - !Ref SNSNotificationTopic
+      OKActions:
+        - !Ref SNSNotificationTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      ComparisonOperator: GreaterThanThreshold
+      Unit: Percent
+      TreatMissingData: notBreaching
+
+  # Additional Monitoring Alarms
+  NeptuneConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alert when number of connections is too high
+      MetricName: DatabaseConnections
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      AlarmActions: 
+        - !Ref SNSNotificationTopic
+      OKActions:
+        - !Ref SNSNotificationTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      ComparisonOperator: GreaterThanThreshold
+      Unit: Count
+      TreatMissingData: notBreaching
+
+  NeptuneReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProd
+    Properties:
+      AlarmDescription: Alert when replication lag is too high
+      MetricName: ReplicaLag
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300
+      AlarmActions: 
+        - !Ref SNSNotificationTopic
+      OKActions:
+        - !Ref SNSNotificationTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      ComparisonOperator: GreaterThanThreshold
+      Unit: Milliseconds
+      TreatMissingData: notBreaching
+
+  NeptuneVolumeWriteIOPSAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alert when Volume Write IOPS is too high
+      MetricName: VolumeWriteIOPs
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      AlarmActions: 
+        - !Ref SNSNotificationTopic
+      OKActions:
+        - !Ref SNSNotificationTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      ComparisonOperator: GreaterThanThreshold
+      Unit: Count/Second
+      TreatMissingData: notBreaching
+
+  NeptuneStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alert when free storage is low
+      MetricName: FreeLocalStorage
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20480  # 20GB in MB
+      AlarmActions: 
+        - !Ref SNSNotificationTopic
+      OKActions:
+        - !Ref SNSNotificationTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      ComparisonOperator: LessThanThreshold
+      Unit: Bytes
+      TreatMissingData: notBreaching
+
+Outputs:
+  NeptuneEndpoint:
+    Description: Neptune cluster endpoint
+    Value: !GetAtt NeptuneCluster.Endpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterEndpoint
+
+  NeptuneReadEndpoint:
+    Description: Neptune cluster read endpoint
+    Value: !GetAtt NeptuneCluster.ReadEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-ReadEndpoint
+
+  NeptunePort:
+    Description: Neptune port
+    Value: !GetAtt NeptuneCluster.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-Port
+
+  NeptuneSecurityGroupId:
+    Description: Security group ID for Neptune cluster
+    Value: !Ref NeptuneSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroup
+
+  ApplicationSecurityGroupId:
+    Description: Security group ID for applications
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-AppSecurityGroup
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for Neptune notifications
+    Value: !Ref SNSNotificationTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-NotificationTopic

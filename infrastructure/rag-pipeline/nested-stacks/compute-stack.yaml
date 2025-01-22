@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced Compute stack for RAG Pipeline infrastructure"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Infrastructure Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnetId
+          - S3BucketName
+          - NeptuneEndpoint
+          - OpenSearchEndpoint
+          - Environment
+          - SageMakerInstanceType
+          - MaxConcurrentExecutions
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Owner
+          - CostCenter
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID
+  PrivateSubnetId:
+    Type: String
+    Description: Private subnet ID
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name
+  NeptuneEndpoint:
+    Type: String
+    Description: Neptune cluster endpoint
+  OpenSearchEndpoint:
+    Type: String
+    Description: OpenSearch domain endpoint
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.g5.xlarge
+    AllowedValues:
+      - ml.g5.xlarge
+      - ml.g5.2xlarge
+      - ml.g5.4xlarge
+    Description: SageMaker instance type
+  Owner:
+    Type: String
+    Description: Owner of the stack
+  CostCenter:
+    Type: String
+    Description: Cost center for billing
+  MaxConcurrentExecutions:
+    Type: Number
+    Default: 100
+    Description: Maximum concurrent Lambda executions
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # VPC Endpoints
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: 
+              - s3:GetObject
+              - s3:PutObject
+            Resource: 
+              - !Sub arn:aws:s3:::${S3BucketName}
+              - !Sub arn:aws:s3:::${S3BucketName}/*
+            Condition:
+              StringEquals:
+                aws:SourceVpc: !Ref VpcId
+
+  # SageMaker Resources
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  SageMakerS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: SageMakerS3Access
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${S3BucketName}
+              - !Sub arn:aws:s3:::${S3BucketName}/*
+      Roles:
+        - !Ref SageMakerExecutionRole
+
+  QueryClassifierModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/query-classifier:latest
+        ModelDataUrl: !Sub s3://${S3BucketName}/models/query-classifier/model.tar.gz
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  QueryClassifierEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - InitialInstanceCount: !If [IsProd, 2, 1]
+          InstanceType: !Ref SageMakerInstanceType
+          ModelName: !GetAtt QueryClassifierModel.ModelName
+          VariantName: AllTraffic
+          InitialVariantWeight: 1.0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  QueryClassifierEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointConfigName: !GetAtt QueryClassifierEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Lambda Resources
+  LambdaDLQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 300
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaCustomPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${QueryClassifierEndpoint.EndpointName}
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQueue.Arn
+              - Effect: Allow
+                Action:
+                  - neptune-db:*
+                Resource: !Sub arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneEndpoint}/*
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: 
+                  - !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchEndpoint}
+                  - !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchEndpoint}/*
+
+  QueryProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub rag-query-processor-${Environment}
+      Handler: index.handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: lambda-functions/query_processor.zip
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetId
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQueue.Arn
+      ReservedConcurrentExecutions: !Ref MaxConcurrentExecutions
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT: !GetAtt QueryClassifierEndpoint.EndpointName
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Auto-scaling for SageMaker endpoint
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !If [IsProd, 5, 2]
+      MinCapacity: !If [IsProd, 2, 1]
+      ResourceId: !Sub endpoint/${AWS::StackName}/${QueryClassifierEndpoint.EndpointName}/variant/AllTraffic
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ServiceNamespace: sagemaker
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: SageMakerVariantInvocationsPerInstance
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationAutoScalingCustomResource
+
+  # Budget Alerts
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly-budget
+        BudgetLimit:
+          Amount: !If [IsProd, 5000, 1000]
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostTypes:
+          IncludeCredit: true
+          IncludeDiscount: true
+          IncludeRefund: true
+          IncludeSubscription: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeTax: true
+          IncludeSupport: true
+          UseBlended: false
+        CostFilters:
+          TagKeyValue:
+            - !Sub user:Environment$${Environment}
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref Owner
+
+Outputs:
+  QueryProcessorFunctionArn:
+    Description: ARN of the Query Processor Lambda function
+    Value: !GetAtt QueryProcessorFunction.Arn
+  SageMakerEndpointName:
+    Description: Name of the SageMaker endpoint
+    Value: !GetAtt QueryClassifierEndpoint.EndpointName
+  DLQueueUrl:
+    Description: URL of the Dead Letter Queue
+    Value: !Ref LambdaDLQueue
+  DLQueueArn:
+    Description: ARN of the Dead Letter Queue
+    Value: !GetAtt LambdaDLQueue.Arn

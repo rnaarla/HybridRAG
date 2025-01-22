@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced S3 Storage stack for RAG Pipeline infrastructure with improved security, monitoring, and cost optimization"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket
+  KmsKeyAlias:
+    Type: String
+    Description: Alias for the KMS key
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues: 
+      - dev
+      - staging
+      - prod
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain backups
+    MinValue: 1
+    MaxValue: 365
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Number of days to retain logs
+    MinValue: 1
+    MaxValue: 365
+  Project:
+    Type: String
+    Default: RAGPipeline
+    Description: Project name for resource tagging
+  Owner:
+    Type: String
+    Description: Team/Person responsible for the resources
+  CostCenter:
+    Type: String
+    Description: Cost center for billing purposes
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${S3BucketName}-logs
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetention
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: KMS key for S3 bucket encryption
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${KmsKeyAlias}
+      TargetKeyId: !Ref KMSKey
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: "s3-access-logs/"
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupTempFiles
+            Status: Enabled
+            Prefix: ragdp-pipeline-assets/temp/
+            ExpirationInDays: 7
+          - Id: BackupRetention
+            Status: Enabled
+            Prefix: ragdp-pipeline-assets/data/
+            ExpirationInDays: !Ref BackupRetentionDays
+      IntelligentTieringConfigurations:
+        - Id: MoveLessAccessedData
+          Status: Enabled
+          Tierings:
+            - Days: 90
+              AccessTier: ARCHIVE_ACCESS
+            - Days: 180
+              AccessTier: DEEP_ARCHIVE_ACCESS
+      MetricsConfigurations:
+        - Id: EntireBucket
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub ${S3Bucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': aws:kms
+          - Sid: DenyHTTP
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: 
+              - !Sub ${S3Bucket.Arn}
+              - !Sub ${S3Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: EnforceTLSVersion
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub ${S3Bucket.Arn}
+              - !Sub ${S3Bucket.Arn}/*
+            Condition:
+              NumericLessThan:
+                's3:TlsVersion': 1.2
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/s3/${S3BucketName}
+      RetentionInDays: !Ref LogRetentionDays
+
+  S3MetricsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroup
+      FilterPattern: "[timestamp, requestid, event]"
+      MetricTransformations:
+        - MetricName: S3ErrorCount
+          MetricNamespace: !Sub "${Environment}/S3"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  S3ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-${S3BucketName}-Errors"
+      AlarmDescription: "Alert on S3 operation errors"
+      MetricName: S3ErrorCount
+      Namespace: !Sub "${Environment}/S3"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !If [IsProd, 1, 5]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      
+  DirectoryCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Configure boto3 with retries
+          config = Config(
+              retries = dict(
+                  max_attempts = 3,
+                  mode = 'adaptive'
+              )
+          )
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3 = boto3.client('s3', config=config)
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      root_folder = 'ragdp-pipeline-assets'
+                      
+                      directories = [
+                          f'{root_folder}/lambda-functions/',
+                          f'{root_folder}/glue-etl-scripts/',
+                          f'{root_folder}/data/uploads/',
+                          f'{root_folder}/data/processed/',
+                          f'{root_folder}/models/sagemaker-models/',
+                          f'{root_folder}/logs/lambda-logs/',
+                          f'{root_folder}/logs/glue-logs/',
+                          f'{root_folder}/temp/'
+                      ]
+                      
+                      for directory in directories:
+                          try:
+                              logger.info(f"Creating directory: {directory}")
+                              s3.put_object(
+                                  Bucket=bucket_name,
+                                  Key=directory
+                              )
+                          except ClientError as e:
+                              logger.error(f"Error creating directory {directory}: {str(e)}")
+                              raise
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Directories created successfully'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Nothing to do for delete'
+                      })
+              except Exception as e:
+                  logger.error(f"Error in handler: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Role: !GetAtt DirectoryCreatorRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  DirectoryCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  CreateDirectories:
+    Type: Custom::S3Directories
+    Properties:
+      ServiceToken: !GetAtt DirectoryCreatorFunction.Arn
+      BucketName: !Ref S3BucketName
+
+Outputs:
+  S3BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref S3Bucket
+  S3BucketArn:
+    Description: ARN of the created S3 bucket
+    Value: !GetAtt S3Bucket.Arn
+  KMSKeyArn:
+    Description: ARN of the KMS key
+    Value: !GetAtt KMSKey.Arn
+  LoggingBucketName:
+    Description: Name of the S3 logging bucket
+    Value: !Ref LoggingBucket
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group
+    Value: !Ref CloudWatchLogGroup

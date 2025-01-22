@@ -1,0 +1,76 @@
+{
+  "Parameters": {
+    "VpcCidr": {
+      "Type": "String",
+      "Default": "10.0.0.0/16"
+    },
+    "PublicSubnetCidr1": {
+      "Type": "String",
+      "Default": "10.0.1.0/24"
+    },
+    "PublicSubnetCidr2": {
+      "Type": "String",
+      "Default": "10.0.2.0/24"
+    },
+    "PrivateSubnetCidr1": {
+      "Type": "String",
+      "Default": "10.0.3.0/24"
+    },
+    "PrivateSubnetCidr2": {
+      "Type": "String",
+      "Default": "10.0.4.0/24"
+    },
+    "S3BucketName": {
+      "Type": "String",
+      "Value": "rn-hybrid-rag-pipeline-storage"
+    },
+    "DeploymentBucketName": {
+      "Type": "String",
+      "Value": "rn-hybrid-rag-deployment"
+    },
+    "KmsKeyAlias": {
+      "Type": "String",
+      "Default": "rag-pipeline-key"
+    },
+    "Environment": {
+      "Type": "String",
+      "Default": "dev"
+    },
+    "NeptuneInstanceClass": {
+      "Type": "String",
+      "Default": "db.r5.large"
+    },
+    "OpenSearchInstanceType": {
+      "Type": "String",
+      "Default": "r6g.large.search"
+    },
+    "SageMakerInstanceType": {
+      "Type": "String",
+      "Default": "ml.g5.xlarge"
+    },
+    "Owner": {
+      "Type": "String",
+      "Value": "Ravi Naarla"
+    },
+    "CostCenter": {
+      "Type": "String",
+      "Value": "personal"
+    },
+    "AlertEmail": {
+      "Type": "String",
+      "Value": "rknaarla@gmail.com"
+    },
+    "AlertEmailSecondary": {
+      "Type": "String",
+      "Value": "rnaarla@gmail.com"
+    },
+    "BackupRetentionDays": {
+      "Type": "Number",
+      "Default": 30
+    },
+    "LogRetentionDays": {
+      "Type": "Number",
+      "Default": 90
+    }
+  }
+}

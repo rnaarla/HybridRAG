@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Parent stack for RAG Pipeline infrastructure"
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  PublicSubnetCidr1:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the first public subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  PublicSubnetCidr2:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the second public subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  PrivateSubnetCidr1:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for the first private subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  PrivateSubnetCidr2:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: CIDR block for the second private subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 63
+  KmsKeyAlias:
+    Type: String
+    Default: rag-pipeline-key
+    Description: Alias for the KMS key
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+  NeptuneInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+    Description: Instance class for Neptune database
+  OpenSearchInstanceType:
+    Type: String
+    Default: r6g.large.search
+    AllowedValues:
+      - r6g.large.search
+      - r6g.xlarge.search
+      - r6g.2xlarge.search
+      - r6g.4xlarge.search
+    Description: Instance type for OpenSearch domain
+  ArtifactBucketName:
+    Type: String
+    Description: Bucket containing nested stack templates
+  EnableVersioning:
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+    Description: Enable versioning for S3 bucket
+  ResourceTags:
+    Type: String
+    Description: JSON string containing additional resource tags
+    Default: "{}"
+
+Resources:
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/networking-stack.yaml
+      Parameters:
+        VpcCidr: !Ref VpcCidr
+        PublicSubnetCidr1: !Ref PublicSubnetCidr1
+        PublicSubnetCidr2: !Ref PublicSubnetCidr2
+        PrivateSubnetCidr1: !Ref PrivateSubnetCidr1
+        PrivateSubnetCidr2: !Ref PrivateSubnetCidr2
+        Environment: !Ref Environment
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 45
+      Tags: 
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Networking
+
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/s3-stack.yaml
+      Parameters:
+        S3BucketName: !Ref S3BucketName
+        KmsKeyAlias: !Ref KmsKeyAlias
+        Environment: !Ref Environment
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        PrivateSubnetIds: !GetAtt NetworkingStack.Outputs.PrivateSubnetIds
+        EnableVersioning: !Ref EnableVersioning
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Storage
+
+  NeptuneStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/neptune-stack.yaml
+      Parameters:
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        PrivateSubnetIds: !GetAtt NetworkingStack.Outputs.PrivateSubnetIds
+        KmsKeyAlias: !Ref KmsKeyAlias
+        Environment: !Ref Environment
+        NeptuneInstanceClass: !Ref NeptuneInstanceClass
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Database
+
+  SearchStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/opensearch-stack.yaml
+      Parameters:
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        PrivateSubnetIds: !GetAtt NetworkingStack.Outputs.PrivateSubnetIds
+        KmsKeyAlias: !Ref KmsKeyAlias
+        Environment: !Ref Environment
+        OpenSearchInstanceType: !Ref OpenSearchInstanceType
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Search
+
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [StorageStack, NeptuneStack, SearchStack]
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/compute-stack.yaml
+      Parameters:
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        PrivateSubnetIds: !GetAtt NetworkingStack.Outputs.PrivateSubnetIds
+        S3BucketName: !GetAtt StorageStack.Outputs.S3BucketName
+        NeptuneEndpoint: !GetAtt NeptuneStack.Outputs.NeptuneEndpoint
+        OpenSearchEndpoint: !GetAtt SearchStack.Outputs.OpenSearchEndpoint
+        Environment: !Ref Environment
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Compute
+
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: ComputeStack
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/monitoring-stack.yaml
+      Parameters:
+        Environment: !Ref Environment
+        QueryProcessorFunctionName: !GetAtt ComputeStack.Outputs.QueryProcessorFunctionName
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 45
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Monitoring
+
+  BackupStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [StorageStack, NeptuneStack, SearchStack]
+    Properties:
+      TemplateURL: !Sub https://${DeploymentBucketName}.s3.${AWS::Region}.amazonaws.com/nested-stacks/backup-stack.yaml
+      Parameters:
+        Environment: !Ref Environment
+        S3BucketName: !GetAtt StorageStack.Outputs.S3BucketName
+        NeptuneClusterId: !GetAtt NeptuneStack.Outputs.NeptuneClusterId
+        OpenSearchDomainArn: !GetAtt SearchStack.Outputs.OpenSearchDomainArn
+        ResourceTags: !Ref ResourceTags
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack
+          Value: Backup
+
+Outputs:
+  VpcId:
+    Description: ID of the created VPC
+    Value: !GetAtt NetworkingStack.Outputs.VpcId
+
+  PrivateSubnetIds:
+    Description: IDs of the private subnets
+    Value: !GetAtt NetworkingStack.Outputs.PrivateSubnetIds
+
+  PublicSubnetIds:
+    Description: IDs of the public subnets
+    Value: !GetAtt NetworkingStack.Outputs.PublicSubnetIds
+
+  S3BucketName:
+    Description: Name of the created S3 bucket
+    Value: !GetAtt StorageStack.Outputs.S3BucketName
+
+  NeptuneEndpoint:
+    Description: Neptune cluster endpoint
+    Value: !GetAtt NeptuneStack.Outputs.NeptuneEndpoint
+
+  NeptuneReadEndpoint:
+    Description: Neptune cluster read endpoint
+    Value: !GetAtt NeptuneStack.Outputs.NeptuneReadEndpoint
+
+  OpenSearchEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt SearchStack.Outputs.OpenSearchEndpoint
+
+  QueryProcessorFunction:
+    Description: Query Processor Lambda function name
+    Value: !GetAtt ComputeStack.Outputs.QueryProcessorFunctionName
+
+  MonitoringDashboardUrl:
+    Description: URL of the CloudWatch monitoring dashboard
+    Value: !GetAtt MonitoringStack.Outputs.DashboardUrl

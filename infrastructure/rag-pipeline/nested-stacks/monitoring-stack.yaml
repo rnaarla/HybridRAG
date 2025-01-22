@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced monitoring and observability stack for RAG Pipeline infrastructure"
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues: [dev, staging, prod]
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function to monitor
+  VpcId:
+    Type: String
+    Description: VPC ID for monitoring resources
+  AlertEvaluationPeriods:
+    Type: Number
+    Default: 2
+    Description: Number of periods to evaluate before triggering alarm
+  AlertThreshold:
+    Type: Number
+    Default: 1
+    Description: Threshold for alarms
+  DashboardRefreshRate:
+    Type: Number
+    Default: 300
+    Description: Dashboard refresh rate in seconds
+  LambdaConcurrentExecutionLimit:
+    Type: Number
+    Default: 100
+    Description: Limit for concurrent Lambda executions
+  MemoryUtilizationThreshold:
+    Type: Number
+    Default: 80
+    Description: Memory utilization threshold percentage
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogRetentionDays: 14
+    staging:
+      LogRetentionDays: 30
+    prod:
+      LogRetentionDays: 90
+
+Resources:
+  # KMS Key for Log Encryption
+  MonitoringKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for monitoring resources encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: RAGPipeline
+        - Key: CostCenter
+          Value: Analytics
+        - Key: SecurityClassification
+          Value: Confidential
+
+  MonitoringKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/monitoring-${Environment}
+      TargetKeyId: !Ref MonitoringKMSKey
+
+  # Dead Letter Queue for Failed Notifications
+  AlertTopicDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: !Ref MonitoringKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: RAGPipeline
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-alerts-${Environment}
+      KmsMasterKeyId: !Ref MonitoringKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: RAGPipeline
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: 
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  # VPC Endpoint for CloudWatch Logs
+  CloudWatchLogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref CloudWatchLogsSecurityGroup
+
+  CloudWatchLogsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for CloudWatch Logs VPC Endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 
+            Fn::ImportValue: !Sub ${VpcId}-CidrBlock
+
+  # Enhanced IAM Role
+  MonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCloudWatchRole
+      Policies:
+        - PolicyName: LogAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !GetAtt ApplicationLogGroup.Arn
+                  - !GetAtt SecurityLogGroup.Arn
+                  - !Sub ${ApplicationLogGroup.Arn}:*
+                  - !Sub ${SecurityLogGroup.Arn}:*
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: RAGPipeline
+
+  # Enhanced CloudWatch Dashboard
+  RagPipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub rag-pipeline-dashboard-${Environment}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${LambdaFunctionName}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."],
+                  [".", "Throttles", ".", "."],
+                  [".", "ConcurrentExecutions", ".", "."],
+                  [".", "MemoryUtilization", ".", "."],
+                  [".", "ColdStart", ".", "."]
+                ],
+                "period": ${DashboardRefreshRate},
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LambdaFunctionName}", { "stat": "p90" }],
+                  [".", ".", ".", ".", { "stat": "p99" }]
+                ],
+                "period": ${DashboardRefreshRate},
+                "region": "${AWS::Region}",
+                "title": "Lambda Latency Percentiles"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/XRay", "TimeToFirstByte", "ServiceType", "AWS::Lambda::Function", "ServiceName", "${LambdaFunctionName}"],
+                  [".", "ErrorRate", ".", ".", ".", "."],
+                  [".", "IntegrationLatency", ".", ".", ".", "."]
+                ],
+                "period": ${DashboardRefreshRate},
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "X-Ray Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/OpenSearch", "FreeStorageSpace", "DomainName", "rag-pipeline-${Environment}"],
+                  [".", "CPUUtilization", ".", "."],
+                  [".", "JVMMemoryPressure", ".", "."]
+                ],
+                "period": ${DashboardRefreshRate},
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "OpenSearch Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Neptune", "CPUUtilization", "DBClusterIdentifier", "rag-pipeline-cluster-${Environment}"],
+                  [".", "FreeableMemory", ".", "."],
+                  [".", "GremlinRequestsPerSec", ".", "."],
+                  [".", "BackupRetentionPeriod", ".", "."]
+                ],
+                "period": ${DashboardRefreshRate},
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Neptune Metrics"
+              }
+            }
+          ]
+        }
+
+  # Enhanced Log Groups
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/rag-pipeline/${Environment}/application
+      RetentionInDays: !FindInMap [EnvironmentMap, !Ref Environment, LogRetentionDays]
+      KmsKeyId: !GetAtt MonitoringKMSKey.Arn
+
+  SecurityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/rag-pipeline/${Environment}/security
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt MonitoringKMSKey.Arn
+
+  # Enhanced CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${LambdaFunctionName}-errors-${Environment}
+      AlarmDescription: Alarm for Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlertEvaluationPeriods
+      Threshold: !Ref AlertThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      TreatMissingData: notBreaching
+
+  LambdaConcurrentExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${LambdaFunctionName}-concurrent-executions-${Environment}
+      AlarmDescription: Alarm for Lambda concurrent executions
+      MetricName: ConcurrentExecutions
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref AlertEvaluationPeriods
+      Threshold: !Ref LambdaConcurrentExecutionLimit
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+
+  MemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${LambdaFunctionName}-memory-utilization-${Environment}
+      AlarmDescription: Alarm for Lambda memory utilization
+      MetricName: MemoryUtilization
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref AlertEvaluationPeriods
+      Threshold: !Ref MemoryUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+
+  # Backup Configuration
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub ${AWS::StackName}-backup
+        BackupPlanRule:
+          - RuleName: DailyBackups
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 5 ? * * *)
+            StartWindowMinutes: 60
+            Lifecycle:
+              DeleteAfterDays: !If [IsProd, 90, 30]
+      BackupPlanTags:
+        Environment: !Ref Environment
+        Owner: RAGPipeline
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub ${AWS::StackName}-vault-${Environment}
+      EncryptionKeyArn: !GetAtt MonitoringKMSKey.Arn
+      BackupVaultTags:
+        Environment: !Ref Environment
+        Owner: RAGPipeline
+
+  # Budget Monitoring
+  MonitoringBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-budget-${Environment}
+        BudgetLimit:
+          Amount: 1000
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostTypes:
+          IncludeTax: true
+          IncludeSubscription: true
+          UseAmortized: false
+        CostFilters:
+          TagKeyValue:
+            - Key: Owner
+              Value: RAGPipeline
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Outputs:
+  DashboardUrl:
+    Description: URL of the CloudWatch Dashboard
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${RagPipelineDashboard}
+    Export:
+      Name: !Sub ${AWS::StackName}-dashboard-url-${Environment}
+  
+  AlertTopicArn:
+    Description: ARN of the SNS alert topic
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-alert-topic-arn-${Environment}
+  
+  AlertTopicDLQUrl:
+    Description: URL of the Dead Letter Queue for failed notifications
+    Value: !Ref AlertTopicDLQ
+    Export:
+      Name: !Sub ${AWS::StackName}-dlq-url-${Environment}
+  
+  ApplicationLogGroupName:
+    Description: Name of the application log group
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-app-log-group-${Environment}
+  
+  SecurityLogGroupName:
+    Description: Name of the security log group
+    Value: !Ref SecurityLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-security-log-group-${Environment}
+  
+  MonitoringKMSKeyArn:
+    Description: ARN of the KMS key used for encryption
+    Value: !GetAtt MonitoringKMSKey.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-kms-key-arn-${Environment}
+  
+  MonitoringRoleArn:
+    Description: ARN of the monitoring IAM role
+    Value: !GetAtt MonitoringRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-monitoring-role-arn-${Environment}
+  
+  BackupVaultName:
+    Description: Name of the backup vault
+    Value: !Ref BackupVault
+    Export:
+      Name: !Sub ${AWS::StackName}-backup-vault-${Environment}
+  
+  CloudWatchLogsVPCEndpointId:
+    Description: ID of the VPC Endpoint for CloudWatch Logs
+    Value: !Ref CloudWatchLogsVPCEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-logs-vpc-endpoint-${Environment}
+  
+  BudgetName:
+    Description: Name of the cost monitoring budget
+    Value: !Sub ${AWS::StackName}-budget-${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-budget-name-${Environment}
+
+  BackupPlanId:
+    Description: ID of the backup plan
+    Value: !Ref BackupPlan
+    Export:
+      Name: !Sub ${AWS::StackName}-backup-plan-id-${Environment}
+
+  SecurityGroupId:
+    Description: ID of the security group for CloudWatch Logs VPC Endpoint
+    Value: !Ref CloudWatchLogsSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-security-group-id-${Environment}
+
+  MetricNamespace:
+    Description: Custom metric namespace for RAG Pipeline
+    Value: !Sub RAGPipeline/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-metric-namespace-${Environment}

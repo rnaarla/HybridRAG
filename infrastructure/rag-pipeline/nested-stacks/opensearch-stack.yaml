@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Enhanced OpenSearch stack for RAG Pipeline infrastructure with vector search capabilities"
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for OpenSearch domain
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of private subnet IDs for OpenSearch domain (minimum 2 for HA)
+    MinLength: 2
+  KmsKeyAlias:
+    Type: String
+    Description: Alias for the KMS key
+    AllowedPattern: "^[a-zA-Z0-9/_-]+$"
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  OpenSearchInstanceType:
+    Type: String
+    Default: r6g.large.search
+    Description: OpenSearch instance type
+    AllowedValues:
+      - r6g.large.search
+      - r6g.xlarge.search
+      - r6g.2xlarge.search
+      - r6g.4xlarge.search
+  LambdaFunctionRole:
+    Type: String
+    Description: ARN of the Lambda function role that will access OpenSearch
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+  BackupStartHour:
+    Type: Number
+    Default: 0
+    Description: Hour (UTC) when automated snapshots will be taken
+    MinValue: 0
+    MaxValue: 23
+  TeamOwner:
+    Type: String
+    Description: Team responsible for this resource
+  CostCenter:
+    Type: String
+    Description: Cost center for billing
+
+Resources:
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenSearch domain
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []  # Will be updated by Lambda security group
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions accessing OpenSearch
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - Description: HTTPS to OpenSearch
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref OpenSearchSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch-Lambda
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  OpenSearchIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OpenSearchSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS access from Lambda function
+
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/opensearch/${AWS::StackName}-${Environment}
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  OpenSearchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: es.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonOpenSearchServiceRole
+      Policies:
+        - PolicyName: OpenSearchVPCAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      EngineVersion: OpenSearch_2.5
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 2
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 2
+        DedicatedMasterEnabled: true
+        DedicatedMasterType: !Ref OpenSearchInstanceType
+        DedicatedMasterCount: 3
+        WarmEnabled: true
+        WarmType: ultrawarm1.medium.search
+        WarmCount: 2
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 100
+        VolumeType: gp3
+        Iops: 3000
+      EncryptionAtRestOptions:
+        Enabled: true
+        KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${KmsKeyAlias}
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+        CustomEndpointEnabled: true
+        CustomEndpoint: !Sub opensearch-${Environment}.${AWS::AccountId}.${AWS::Region}
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: !Sub opensearch-admin-${Environment}
+          MasterUserPassword: !Sub '{{resolve:secretsmanager:${OpenSearchMasterUserSecret}:SecretString:password}}'
+      VPCOptions:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+      LogPublishingOptions:
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: !Ref BackupStartHour
+      AdvancedOptions:
+        override_main_response_version: true
+        rest.action.multi.allow_explicit_index: true
+        indices.query.bool.max_clause_count: "8192"
+        indices.fielddata.cache.size: "40"
+        indices.memory.index_buffer_size: "20"
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref LambdaFunctionRole
+            Action:
+              - es:ESHttp*
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/rag-pipeline-${Environment}/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  OpenSearchMasterUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub opensearch-master-user-${Environment}
+      Description: Master user credentials for OpenSearch domain
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # CloudWatch Alarms
+  ClusterStatusRedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when cluster status is red
+      MetricName: ClusterStatus.red
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Sub rag-pipeline-${Environment}  # Match the domain name pattern
+        - Name: ClientId
+          Value: !Ref AWS::AccountId
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  FreeStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when free storage space is low
+      MetricName: FreeStorageSpace
+      Namespace: AWS/ES
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20000
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref AWS::AccountId
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/ES
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref AWS::AccountId
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${AWS::StackName}-OpenSearch-Alarms
+      TopicName: !Sub ${AWS::StackName}-OpenSearch-Alarms
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # OpenSearch Index Template setup remains the same as in original template
+  OpenSearchIndexTemplate:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt OpenSearchIndexSetupFunction.Arn
+      DomainEndpoint: !GetAtt OpenSearchDomain.DomainEndpoint
+      MasterUserSecret: !Ref OpenSearchMasterUserSecret
+      Environment: !Ref Environment
+
+  OpenSearchIndexSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import requests
+          import json
+          from requests.auth import HTTPBasicAuth
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Get OpenSearch credentials
+                      sm = boto3.client('secretsmanager')
+                      secret = sm.get_secret_value(SecretId=event['ResourceProperties']['MasterUserSecret'])
+                      creds = json.loads(secret['SecretString'])
+                      
+                      # OpenSearch endpoint
+                      host = event['ResourceProperties']['DomainEndpoint']
+                      
+                      # Create vector search index template
+                      template = {
+                          "index_patterns": ["rag-*"],
+                          "template": {
+                              "settings": {
+                                  "index": {
+                                      "knn": True,
+                                      "knn.algo_param.ef_search": 512
+                                  }
+                              },
+                              "mappings": {
+                                  "properties": {
+                                      "vector_field": {
+                                          "type": "knn_vector",
+                                          "dimension": 768,
+                                          "method": {
+                                              "name": "hnsw",
+                                              "space_type": "cosine",
+                                              "engine": "nmslib",
+                                              "parameters": {
+                                                  "ef_construction": 512,
+                                                  "m": 16
+                                              }
+                                          }
+                                      },
+                                      "text": {"type": "text"},
+                                      "metadata": {"type": "object"}
+                                  }
+                              }
+                          }
+                      }
+                      
+                      # Create index template
+                      url = f'https://{host}/_index_template/rag_vector_template'
+                      response = requests.put(
+                          url,
+                          auth=HTTPBasicAuth(creds['username'], creds['password']),
+                          json=template,
+                          headers={'Content-Type': 'application/json'},
+                          verify=True
+                      )
+                      
+                      if response.status_code not in [200, 201]:
+                          raise Exception(f"Failed to create index template: {response.text}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          "Message": "Successfully created OpenSearch index template"
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          "Message": "No action needed for Delete"
+                      })
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      "Error": str(e)
+                  })
+      Role: !GetAtt OpenSearchIndexSetupRole.Arn
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  OpenSearchIndexSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomain}/*
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OpenSearchMasterUserSecret
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: OpenSearch
+        - Key: Owner
+          Value: !Ref TeamOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+Outputs:
+  OpenSearchEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-OpenSearchEndpoint
+
+  OpenSearchDomainArn:
+    Description: OpenSearch domain ARN
+    Value: !GetAtt OpenSearchDomain.DomainArn
+    Export:
+      Name: !Sub ${AWS::StackName}-OpenSearchDomainArn
+
+  OpenSearchSecurityGroupId:
+    Description: Security group ID for OpenSearch domain
+    Value: !Ref OpenSearchSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-OpenSearchSecurityGroupId
+
+  OpenSearchCustomEndpoint:
+    Description: Custom endpoint for OpenSearch domain
+    Value: !Sub https://opensearch-${Environment}.${AWS::AccountId}.${AWS::Region}
+    Export:
+      Name: !Sub ${AWS::StackName}-OpenSearchCustomEndpoint
+
+  LambdaSecurityGroupId:
+    Description: Security group ID for Lambda functions
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaSecurityGroupId
+
+  AlarmTopicArn:
+    Description: ARN of the SNS topic for OpenSearch alarms
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-AlarmTopicArn
